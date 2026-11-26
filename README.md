@@ -1,7 +1,12 @@
-# 园区路由器静态路由整表切换排程服务
+# 园区路由器静态路由切换排程与压缩服务
 
-值班员提交园区路由器的**新旧两份 IPv4 静态路由表**和一组**保通要求**，服务排出
-**批数最少**的整表切换下发计划。
+两个能力，共用一个服务：
+
+1. **整表切换排程**：值班员提交园区路由器的**新旧两份 IPv4 静态路由表**和一组
+   **保通要求**，服务排出**批数最少**的整表切换下发计划。
+2. **静态路由表压缩**：值班员提交**全网 IPv4 静态路由表**、**目标路由器**和它
+   **可直连的下一跳名单**（可附邻接拓扑），服务返回只改目标设备的、**条目数
+   最少**的完整替换表；口径是逐跳 LPM 行为与原表等价。
 
 ## 业务约束
 
@@ -44,11 +49,12 @@
 
 ```
 app/
-  models.py    Pydantic 请求/响应模型与入参校验
+  models.py    Pydantic 请求/响应模型与入参校验（PlanRequest / CompressRequest）
   ipcore.py    IPv4 前缀、LPM、等价类分解、逐跳仿真、证据结构
   planner.py   批计划 BFS 求解器
-  main.py      FastAPI 路由
-tests/         22 个单元/性质/API 测试
+  compress.py  静态路由表压缩：等价类 + 前缀树最小覆盖 DP
+  main.py      FastAPI 路由（/plan、/compress）
+tests/         43 个单元/性质/API 测试
 examples/      可直接调用的请求样例
 Dockerfile, docker-compose.yml, requirements.txt
 ```
@@ -75,6 +81,7 @@ python3 -m venv .venv
 - `GET /health` 健康检查
 - `GET /constraints` 返回规模与校验口径约束
 - `POST /plan` 提交排程请求
+- `POST /compress` 提交静态路由表压缩请求
 
 ### 请求字段
 
@@ -128,6 +135,84 @@ curl -s -X POST http://localhost:8000/plan \
 - `hop_by_hop`：每跳节点、命中的 LPM 前缀、下一跳；环路附闭合说明
 - `reproduction`：三步中文复现指引
 
+## 静态路由表压缩 API：`POST /compress`
+
+静态路由表快装满时，值班员需要一份能直接替换的精简表。该接口只改**目标设备**
+一台，其余设备保持原表不变。
+
+### 请求字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `tables` | 设备名 → 路由表（`{目的网段: 下一跳}`）的**全网** IPv4 静态路由表 |
+| `target` | 目标路由器名称，必须出现在 `tables` 中 |
+| `next_hops` | 目标设备**可直连**的下一跳名单：可含邻居路由器与直连外部出口；**必须包含**目标设备原表的全部下一跳 |
+| `topology` | 可选，路由器直连邻接（`设备名 → [邻居…]`）；提供后会校验目标设备的候选首跳是否确为直连邻居。出口名（非路由器）不要写进 topology |
+
+下一跳取值约定与 `/plan` 一致：值是受管路由器名表示转发到该路由器，否则视为
+直连外部出口/接口名。
+
+### 正确性口径
+
+替换表必须与原表**逐跳 LPM 行为等价**：
+
+- 原表没有匹配项的地址，替换表仍须无匹配；
+- 原表有匹配项的地址，替换后仍须从**原来的外部出口**离开；
+- 替换后的路径不能绕回目标设备；
+- 条目数最少。
+
+实现上不逐地址穷举：取全网所有前缀为边界，把地址空间切成有限个**路由等价类**
+（均匀区段），每段只验一个代表地址；再在前缀树上做“最小条目覆盖”动态规划。
+条目只能落在“整段原表都有匹配”的节点上，因此不会覆盖到原表无匹配的地址。
+
+### 可行响应示例
+
+```bash
+curl -s -X POST http://localhost:8000/compress \
+  -H 'Content-Type: application/json' \
+  -d @examples/compress.json
+```
+
+```json
+{
+  "status": "ok",
+  "target_router": "T",
+  "original_route_count": 6,
+  "compressed_route_count": 2,
+  "removed_entries": 4,
+  "routes": {"0.0.0.0/0": "ISP1", "10.3.0.0/16": "ISP2"},
+  "equivalence_class_count": 43,
+  "unmatched_region_count": 0,
+  "verified_equivalent": true,
+  "note": "..."
+}
+```
+
+`routes` 即替换表：直接整表下发到 `target` 即可。`verified_equivalent` 表示服务
+已用替换表重建目标设备路由视图并逐等价类重放复核通过。
+
+### 原表有匹配却到不了外部出口
+
+```bash
+curl -s -X POST http://localhost:8000/compress \
+  -H 'Content-Type: application/json' \
+  -d @examples/compress-unsat.json
+```
+
+此时不生成替换表，返回 `status: "unsat"` 及一个目的地址与逐跳路径：
+
+- `dst_address` + `dst_equivalence_class`：复现用的目的地址及其等价类
+- `matched_prefix`：原表命中的前缀
+- `reason`：`no_route`（断路）/ `loop`（环路）/ `no_link`（无直连邻接）
+- `hop_by_hop`：每跳节点、命中的 LPM 前缀、下一跳
+- `reproduction`：三步中文复现指引
+
+### 400 与 422
+
+- 422：结构性问题（非法网段、目标不在 `tables` 中、名单缺目标原表下一跳、名单重复）；
+- 400：`topology` 引用了非路由器的设备名、或名单中没有任何下一跳能等价复现原表
+  的外部出口行为。
+
 ## 测试
 
 ```bash
@@ -136,4 +221,6 @@ curl -s -X POST http://localhost:8000/plan \
 
 覆盖：等价类分解的随机性质（类内 LPM 恒等、并集全覆盖）、批次全部内部子集的
 独立复核、最短批数、批大小上限、12 台规模性能（< 10s）、断路/环路/错误出口/
-无邻接证据、证据可独立重放、FastAPI 端到端与 400/422 校验。
+无邻接证据、证据可独立重放、FastAPI 端到端与 400/422 校验。压缩接口另有：条目
+合并与更长前缀覆盖、无匹配地址保持、绕回目标的排除、等价性抽样复核、与独立
+穷举对照的**最少条目**验证、原表不可达证据、API 校验。
